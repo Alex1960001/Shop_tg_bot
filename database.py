@@ -780,6 +780,45 @@ def update_product(
         return cursor.rowcount > 0
 
 
+def update_product_category(
+    product_id: int,
+    category_id: int,
+) -> bool:
+    product_id = int(product_id)
+    category_id = int(category_id)
+
+    with connect() as connection:
+        category = connection.execute(
+            """
+            SELECT id
+            FROM categories
+            WHERE id = ?
+              AND is_active = 1
+            """,
+            (category_id,),
+        ).fetchone()
+
+        if category is None:
+            raise ValueError(
+                "Категория не найдена или скрыта"
+            )
+
+        cursor = connection.execute(
+            """
+            UPDATE products
+            SET category_id = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                category_id,
+                product_id,
+            ),
+        )
+
+        return cursor.rowcount == 1
+
+
 def set_product_active(
     product_id: int,
     is_active: bool,

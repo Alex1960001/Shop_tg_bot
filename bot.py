@@ -65,6 +65,7 @@ from database import (
     update_category,
     update_product,
     upsert_user,
+    update_product_category,
 )
 from keyboards import (
     admin_back_keyboard,
@@ -3573,6 +3574,121 @@ async def admin_product_cancel(
         await callback.message.answer(
             "⚙️ <b>Админ-панель Beauty Shop</b>",
             reply_markup=admin_main_keyboard(),
+        )
+
+
+@dp.callback_query(
+    F.data.regexp(
+        r"^admin:product:move:\d+$"
+    )
+)
+async def admin_product_move_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    product_id = int(
+        str(callback.data).split(":")[3]
+    )
+    product = get_product(product_id)
+
+    if product is None:
+        await callback.answer(
+            "Товар не найден",
+            show_alert=True,
+        )
+        return
+
+    categories = get_categories(
+        active_only=True
+    )
+
+    if not categories:
+        await callback.answer(
+            "Нет активных категорий.",
+            show_alert=True,
+        )
+        return
+
+    # Запоминаем товар, категорию которого меняем.
+    await state.clear()
+    await state.update_data(
+        product_id=product_id
+    )
+
+    await callback.answer()
+
+    if callback.message:
+        await replace_message(
+            callback.message,
+            "Выберите новую категорию товара:",
+            admin_product_categories_keyboard(
+                categories,
+                "move",
+            ),
+        )
+
+
+@dp.callback_query(
+    F.data.regexp(
+        r"^admin:product:move:category:\d+$"
+    )
+)
+async def admin_product_move_save(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    category_id = int(
+        str(callback.data).split(":")[4]
+    )
+    data = await state.get_data()
+
+    try:
+        product_id = int(
+            data["product_id"]
+        )
+    except (KeyError, TypeError, ValueError):
+        await state.clear()
+        await callback.answer(
+            "Данные потеряны. Откройте товар заново.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        updated = update_product_category(
+            product_id=product_id,
+            category_id=category_id,
+        )
+    except ValueError as error:
+        await callback.answer(
+            str(error),
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+
+    if not updated:
+        await callback.answer(
+            "Товар не найден",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer(
+        "Категория изменена"
+    )
+
+    if callback.message:
+        await show_admin_product(
+            callback.message,
+            product_id,
         )
 
 

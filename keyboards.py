@@ -699,7 +699,7 @@ def admin_product_categories_keyboard(
     categories: list[Any],
     action: str,
 ) -> InlineKeyboardMarkup:
-    if action not in {"create", "edit"}:
+    if action not in {"create", "edit", "move"}:
         raise ValueError(
             "Неизвестное действие с товаром"
         )
@@ -743,6 +743,15 @@ def admin_product_keyboard(
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗂 Изменить категорию",
+                    callback_data=(
+                        f"admin:product:move:"
+                        f"{product_id}"
+                    ),
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="✏️ Редактировать",
