@@ -111,6 +111,26 @@ def create_tables() -> None:
                     REFERENCES categories(id)
                     ON DELETE RESTRICT
             );
+            CREATE TABLE IF NOT EXISTS product_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    volume TEXT NOT NULL,
+    price INTEGER NOT NULL CHECK(price > 0),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(product_id)
+        REFERENCES products(id)
+        ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+    idx_product_variants_unique
+    ON product_variants(
+        product_id,
+        volume COLLATE NOCASE
+    );
 
             CREATE TABLE IF NOT EXISTS cart_items (
                 user_id INTEGER NOT NULL,
@@ -203,7 +223,103 @@ def create_tables() -> None:
                 idx_cart_items_user
                 ON cart_items(user_id);
             """
+        )        # Миграция корзины. Старые записи сохраняются.
+        cart_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(cart_items)"
+            ).fetchall()
+        }
+
+        if "variant_id" not in cart_columns:
+            connection.execute(
+                "ALTER TABLE cart_items "
+                "RENAME TO cart_items_old"
+            )
+
+            connection.executescript(
+                """
+                CREATE TABLE cart_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    variant_id INTEGER,
+                    quantity INTEGER NOT NULL DEFAULT 1
+                        CHECK(quantity > 0),
+                    created_at TEXT NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id)
+                        REFERENCES users(user_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(product_id)
+                        REFERENCES products(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(variant_id)
+                        REFERENCES product_variants(id)
+                        ON DELETE CASCADE
+                );
+
+                INSERT INTO cart_items (
+                    user_id,
+                    product_id,
+                    variant_id,
+                    quantity,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    user_id,
+                    product_id,
+                    NULL,
+                    quantity,
+                    created_at,
+                    updated_at
+                FROM cart_items_old;
+
+                DROP TABLE cart_items_old;
+                """
+            )
+
+        connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_cart_items_user
+                ON cart_items(user_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_cart_unique_variant
+                ON cart_items(
+                    user_id,
+                    product_id,
+                    IFNULL(variant_id, 0)
+                );
+            """
         )
+
+        order_item_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(order_items)"
+            ).fetchall()
+        }
+
+        if "variant_id" not in order_item_columns:
+            connection.execute(
+                """
+                ALTER TABLE order_items
+                ADD COLUMN variant_id INTEGER
+                """
+            )
+
+        if "volume" not in order_item_columns:
+            connection.execute(
+                """
+                ALTER TABLE order_items
+                ADD COLUMN volume TEXT
+                """
+            )
 
 
 # ----------------------------------------------------------------------
@@ -493,34 +609,78 @@ def update_category(
 def delete_category(
     category_id: int,
 ) -> bool:
+    category_id = int(category_id)
+
     with connect() as connection:
-        product = connection.execute(
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(products)"
+            ).fetchall()
+        }
+
+        if "is_deleted" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE products
+                ADD COLUMN is_deleted
+                INTEGER NOT NULL DEFAULT 0
+                """
+            )
+
+        # Запрещаем удаление только при наличии
+        # неудалённых товаров.
+        active_product = connection.execute(
+            """
+            SELECT 1
+            FROM products
+            WHERE category_id = ?
+              AND is_deleted = 0
+            LIMIT 1
+            """,
+            (category_id,),
+        ).fetchone()
+
+        if active_product is not None:
+            return False
+
+        # Архивные товары могут ссылаться на категорию,
+        # поэтому такую категорию скрываем.
+        archived_product = connection.execute(
             """
             SELECT 1
             FROM products
             WHERE category_id = ?
             LIMIT 1
             """,
-            (int(category_id),),
+            (category_id,),
         ).fetchone()
 
-        if product is not None:
-            return False
-
-        cursor = connection.execute(
-            """
-            DELETE FROM categories
-            WHERE id = ?
-            """,
-            (int(category_id),),
-        )
+        if archived_product is not None:
+            cursor = connection.execute(
+                """
+                UPDATE categories
+                SET is_active = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (category_id,),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                DELETE FROM categories
+                WHERE id = ?
+                """,
+                (category_id,),
+            )
 
         return cursor.rowcount > 0
-
 
 # ----------------------------------------------------------------------
 # Товары
 # ----------------------------------------------------------------------
+
 
 def create_product(
     category_id: int,
@@ -924,16 +1084,307 @@ def delete_product(
         return cursor.rowcount > 0
 
 
+def get_product_variants(
+    product_id: int,
+    active_only: bool = True,
+) -> list[sqlite3.Row]:
+    query = """
+        SELECT *
+        FROM product_variants
+        WHERE product_id = ?
+    """
+
+    if active_only:
+        query += " AND is_active = 1"
+
+    query += " ORDER BY sort_order, id"
+
+    with connect() as connection:
+        return connection.execute(
+            query,
+            (int(product_id),),
+        ).fetchall()
+
+
+def get_product_variant(
+    variant_id: int,
+) -> sqlite3.Row | None:
+    with connect() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM product_variants
+            WHERE id = ?
+            """,
+            (int(variant_id),),
+        ).fetchone()
+
+
+def create_product_variant(
+    product_id: int,
+    volume: str,
+    price: int,
+    sort_order: int = 0,
+) -> int:
+    volume = " ".join(
+        str(volume or "").strip().split()
+    )
+    price = int(price)
+
+    if not volume:
+        raise ValueError("Объём не может быть пустым")
+
+    if len(volume) > 40:
+        raise ValueError("Объём слишком длинный")
+
+    if price <= 0:
+        raise ValueError("Цена должна быть больше нуля")
+
+    with connect() as connection:
+        product = connection.execute(
+            "SELECT id FROM products WHERE id = ?",
+            (int(product_id),),
+        ).fetchone()
+
+        if product is None:
+            raise ValueError("Товар не найден")
+
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO product_variants (
+                    product_id,
+                    volume,
+                    price,
+                    sort_order
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    int(product_id),
+                    volume,
+                    price,
+                    int(sort_order),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(
+                "Такой объём уже существует"
+            ) from error
+
+        return int(cursor.lastrowid)
+
+
+def update_product_variant(
+    variant_id: int,
+    volume: str,
+    price: int,
+) -> bool:
+    volume = " ".join(
+        str(volume or "").strip().split()
+    )
+    price = int(price)
+
+    if not volume or len(volume) > 40:
+        raise ValueError("Некорректный объём")
+
+    if price <= 0:
+        raise ValueError(
+            "Цена должна быть больше нуля"
+        )
+
+    with connect() as connection:
+        variant = connection.execute(
+            """
+            SELECT product_id
+            FROM product_variants
+            WHERE id = ?
+            """,
+            (int(variant_id),),
+        ).fetchone()
+
+        if variant is None:
+            return False
+
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE product_variants
+                SET volume = ?,
+                    price = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    volume,
+                    price,
+                    int(variant_id),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(
+                "Такой объём уже существует"
+            ) from error
+
+        connection.execute(
+            """
+            UPDATE products
+            SET price = COALESCE(
+                (
+                    SELECT MIN(price)
+                    FROM product_variants
+                    WHERE product_id = ?
+                      AND is_active = 1
+                ),
+                price
+            ),
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                int(variant["product_id"]),
+                int(variant["product_id"]),
+            ),
+        )
+
+        return cursor.rowcount > 0
+
+
+def set_product_variant_active(
+    variant_id: int,
+    is_active: bool,
+) -> bool:
+    with connect() as connection:
+        variant = connection.execute(
+            """
+            SELECT product_id
+            FROM product_variants
+            WHERE id = ?
+            """,
+            (int(variant_id),),
+        ).fetchone()
+
+        if variant is None:
+            return False
+
+        cursor = connection.execute(
+            """
+            UPDATE product_variants
+            SET is_active = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                int(bool(is_active)),
+                int(variant_id),
+            ),
+        )
+
+        connection.execute(
+            """
+            UPDATE products
+            SET price = COALESCE(
+                (
+                    SELECT MIN(price)
+                    FROM product_variants
+                    WHERE product_id = ?
+                      AND is_active = 1
+                ),
+                price
+            ),
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                int(variant["product_id"]),
+                int(variant["product_id"]),
+            ),
+        )
+
+        return cursor.rowcount > 0
+
+
+def delete_product_variant(
+    variant_id: int,
+) -> bool:
+    with connect() as connection:
+        variant = connection.execute(
+            """
+            SELECT product_id
+            FROM product_variants
+            WHERE id = ?
+            """,
+            (int(variant_id),),
+        ).fetchone()
+
+        if variant is None:
+            return False
+
+        used = connection.execute(
+            """
+            SELECT 1
+            FROM order_items
+            WHERE variant_id = ?
+            LIMIT 1
+            """,
+            (int(variant_id),),
+        ).fetchone()
+
+        if used is not None:
+            return False
+
+        connection.execute(
+            """
+            DELETE FROM cart_items
+            WHERE variant_id = ?
+            """,
+            (int(variant_id),),
+        )
+
+        cursor = connection.execute(
+            """
+            DELETE FROM product_variants
+            WHERE id = ?
+            """,
+            (int(variant_id),),
+        )
+
+        product_id = int(
+            variant["product_id"]
+        )
+
+        connection.execute(
+            """
+            UPDATE products
+            SET price = COALESCE(
+                (
+                    SELECT MIN(price)
+                    FROM product_variants
+                    WHERE product_id = ?
+                      AND is_active = 1
+                ),
+                price
+            ),
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (product_id, product_id),
+        )
+
+        return cursor.rowcount > 0
 # ----------------------------------------------------------------------
 # Корзина
 # ----------------------------------------------------------------------
+
 
 def add_to_cart(
     user_id: int,
     product_id: int,
     quantity: int = 1,
+    variant_id: int | None = None,
 ) -> bool:
     quantity = int(quantity)
+    product_id = int(product_id)
 
     if quantity <= 0:
         return False
@@ -946,33 +1397,101 @@ def add_to_cart(
             WHERE id = ?
               AND is_active = 1
             """,
-            (int(product_id),),
+            (product_id,),
         ).fetchone()
 
         if product is None:
             return False
 
-        try:
+        variant_count = int(
             connection.execute(
                 """
-                INSERT INTO cart_items (
-                    user_id,
-                    product_id,
-                    quantity
-                )
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, product_id)
-                DO UPDATE SET
-                    quantity = cart_items.quantity
-                               + excluded.quantity,
-                    updated_at = CURRENT_TIMESTAMP
+                SELECT COUNT(*)
+                FROM product_variants
+                WHERE product_id = ?
+                  AND is_active = 1
+                """,
+                (product_id,),
+            ).fetchone()[0]
+        )
+
+        if variant_count > 0:
+            if variant_id is None:
+                return False
+
+            variant = connection.execute(
+                """
+                SELECT id
+                FROM product_variants
+                WHERE id = ?
+                  AND product_id = ?
+                  AND is_active = 1
                 """,
                 (
-                    int(user_id),
-                    int(product_id),
-                    quantity,
+                    int(variant_id),
+                    product_id,
                 ),
-            )
+            ).fetchone()
+
+            if variant is None:
+                return False
+        else:
+            variant_id = None
+
+        existing = connection.execute(
+            """
+            SELECT id, quantity
+            FROM cart_items
+            WHERE user_id = ?
+              AND product_id = ?
+              AND (
+                    variant_id = ?
+                    OR (
+                        variant_id IS NULL
+                        AND ? IS NULL
+                    )
+              )
+            """,
+            (
+                int(user_id),
+                product_id,
+                variant_id,
+                variant_id,
+            ),
+        ).fetchone()
+
+        try:
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE cart_items
+                    SET quantity = quantity + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        quantity,
+                        int(existing["id"]),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO cart_items (
+                        user_id,
+                        product_id,
+                        variant_id,
+                        quantity
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(user_id),
+                        product_id,
+                        variant_id,
+                        quantity,
+                    ),
+                )
         except sqlite3.IntegrityError:
             return False
 
@@ -983,52 +1502,48 @@ def set_cart_quantity(
     user_id: int,
     product_id: int,
     quantity: int,
+    variant_id: int | None = None,
 ) -> bool:
     quantity = int(quantity)
+
+    condition = """
+        user_id = ?
+        AND product_id = ?
+        AND (
+            variant_id = ?
+            OR (
+                variant_id IS NULL
+                AND ? IS NULL
+            )
+        )
+    """
+
+    parameters = (
+        int(user_id),
+        int(product_id),
+        variant_id,
+        variant_id,
+    )
 
     with connect() as connection:
         if quantity <= 0:
             cursor = connection.execute(
-                """
+                f"""
                 DELETE FROM cart_items
-                WHERE user_id = ?
-                  AND product_id = ?
+                WHERE {condition}
                 """,
-                (
-                    int(user_id),
-                    int(product_id),
-                ),
+                parameters,
             )
-
-            return cursor.rowcount > 0
-
-        product = connection.execute(
-            """
-            SELECT id
-            FROM products
-            WHERE id = ?
-              AND is_active = 1
-            """,
-            (int(product_id),),
-        ).fetchone()
-
-        if product is None:
-            return False
-
-        cursor = connection.execute(
-            """
-            UPDATE cart_items
-            SET quantity = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?
-              AND product_id = ?
-            """,
-            (
-                quantity,
-                int(user_id),
-                int(product_id),
-            ),
-        )
+        else:
+            cursor = connection.execute(
+                f"""
+                UPDATE cart_items
+                SET quantity = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE {condition}
+                """,
+                (quantity, *parameters),
+            )
 
         return cursor.rowcount > 0
 
@@ -1040,24 +1555,34 @@ def get_cart(
         return connection.execute(
             """
             SELECT
+                cart_items.id AS cart_item_id,
                 cart_items.product_id,
+                cart_items.variant_id,
                 cart_items.quantity,
                 products.code,
                 products.name_ru,
                 products.name_cs,
                 products.name_uk,
-                products.price,
+                COALESCE(
+                    product_variants.price,
+                    products.price
+                ) AS price,
+                product_variants.volume,
                 products.stock,
                 products.photo,
                 products.is_active
             FROM cart_items
             JOIN products
-              ON products.id =
-                 cart_items.product_id
+              ON products.id = cart_items.product_id
+            LEFT JOIN product_variants
+              ON product_variants.id =
+                 cart_items.variant_id
             WHERE cart_items.user_id = ?
             ORDER BY
                 products.sort_order,
-                products.id
+                products.id,
+                product_variants.sort_order,
+                product_variants.id
             """,
             (int(user_id),),
         ).fetchall()
@@ -1090,9 +1615,8 @@ def create_order(
     language: str,
     payment_method: str,
 ) -> int | None:
-    language = normalize_language(
-        language
-    )
+    language = normalize_language(language)
+
     payment_method = str(
         payment_method or ""
     ).strip().lower()
@@ -1103,9 +1627,7 @@ def create_order(
         )
 
     customer_name = " ".join(
-        str(customer_name or "")
-        .strip()
-        .split()
+        str(customer_name or "").strip().split()
     )
 
     if (
@@ -1116,21 +1638,13 @@ def create_order(
             flags=re.UNICODE,
         )
     ):
-        raise ValueError(
-            "Некорректное имя"
-        )
+        raise ValueError("Некорректное имя")
 
     phone = str(phone or "").strip()
-    phone_digits = re.sub(
-        r"\D",
-        "",
-        phone,
-    )
+    phone_digits = re.sub(r"\D", "", phone)
 
     if not 7 <= len(phone_digits) <= 15:
-        raise ValueError(
-            "Некорректный телефон"
-        )
+        raise ValueError("Некорректный телефон")
 
     delivery_method = str(
         delivery_method or ""
@@ -1144,14 +1658,9 @@ def create_order(
     expected_delivery_price = int(
         DELIVERY_METHODS[delivery_method]
     )
-    delivery_price = int(
-        delivery_price
-    )
+    delivery_price = int(delivery_price)
 
-    if (
-        delivery_price
-        != expected_delivery_price
-    ):
+    if delivery_price != expected_delivery_price:
         raise ValueError(
             "Неверная стоимость доставки"
         )
@@ -1170,16 +1679,10 @@ def create_order(
             flags=re.UNICODE,
         )
     ):
-        raise ValueError(
-            "Некорректный адрес"
-        )
+        raise ValueError("Некорректный адрес")
 
     with connect() as connection:
-        # Блокирует конкурентную запись до завершения
-        # создания заказа и списания остатков.
-        connection.execute(
-            "BEGIN IMMEDIATE"
-        )
+        connection.execute("BEGIN IMMEDIATE")
 
         user = connection.execute(
             """
@@ -1199,20 +1702,32 @@ def create_order(
             """
             SELECT
                 cart_items.product_id,
+                cart_items.variant_id,
                 cart_items.quantity,
                 products.code,
                 products.name_ru,
                 products.name_cs,
                 products.name_uk,
-                products.price,
-                
+                COALESCE(
+                    product_variants.price,
+                    products.price
+                ) AS price,
+                product_variants.volume,
+                product_variants.is_active
+                    AS variant_is_active,
                 products.is_active
             FROM cart_items
             JOIN products
               ON products.id =
                  cart_items.product_id
+            LEFT JOIN product_variants
+              ON product_variants.id =
+                 cart_items.variant_id
             WHERE cart_items.user_id = ?
-            ORDER BY products.id
+            ORDER BY
+                products.id,
+                product_variants.sort_order,
+                product_variants.id
             """,
             (int(user_id),),
         ).fetchall()
@@ -1227,17 +1742,29 @@ def create_order(
 
             if not bool(item["is_active"]):
                 raise ValueError(
-                    f"Товар {item['code']} больше недоступен"
+                    f"Товар {item['code']} "
+                    "больше недоступен"
+                )
+
+            if (
+                item["variant_id"] is not None
+                and (
+                    item["volume"] is None
+                    or not bool(
+                        item["variant_is_active"]
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Выбранный объём товара "
+                    f"{item['code']} больше недоступен"
                 )
 
             products_total += (
                 int(item["price"]) * quantity
             )
 
-        total = (
-            products_total
-            + delivery_price
-        )
+        total = products_total + delivery_price
 
         cursor = connection.execute(
             """
@@ -1275,39 +1802,40 @@ def create_order(
             ),
         )
 
-        order_id = int(
-            cursor.lastrowid
-        )
+        order_id = int(cursor.lastrowid)
 
         for item in cart:
-            quantity = int(
-                item["quantity"]
-            )
-            product_id = int(
-                item["product_id"]
-            )
+            quantity = int(item["quantity"])
+            product_id = int(item["product_id"])
+
             product_name = (
                 item[f"name_{language}"]
                 or item["name_ru"]
             )
 
-            stock_cursor = (
-                connection.execute(
-                    """
-                    UPDATE products
-                    SET stock = stock - ?,
-                        updated_at =
-                            CURRENT_TIMESTAMP
-                    WHERE id = ?
-                      AND is_active = 1
-                      AND stock >= ?
-                    """,
-                    (
-                        quantity,
-                        product_id,
-                        quantity,
-                    ),
-                )
+            volume = str(
+                item["volume"] or ""
+            ).strip()
+
+            order_product_name = str(product_name)
+
+            if volume:
+                order_product_name += f" ({volume})"
+
+            connection.execute(
+                """
+                UPDATE products
+                SET stock = stock - ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND is_active = 1
+                  AND stock >= ?
+                """,
+                (
+                    quantity,
+                    product_id,
+                    quantity,
+                ),
             )
 
             connection.execute(
@@ -1315,18 +1843,22 @@ def create_order(
                 INSERT INTO order_items (
                     order_id,
                     product_id,
+                    variant_id,
                     product_code,
                     product_name,
+                    volume,
                     price,
                     quantity
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
                     product_id,
+                    item["variant_id"],
                     str(item["code"]),
-                    str(product_name),
+                    order_product_name,
+                    volume or None,
                     int(item["price"]),
                     quantity,
                 ),
@@ -1337,8 +1869,7 @@ def create_order(
                 """
                 UPDATE orders
                 SET variable_symbol = ?,
-                    updated_at =
-                        CURRENT_TIMESTAMP
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (

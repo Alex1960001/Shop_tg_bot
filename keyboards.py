@@ -244,6 +244,47 @@ def product_keyboard(
     )
 
 
+def product_variants_keyboard(
+    product_id: int,
+    category_id: int,
+    variants: list[Any],
+    language: str,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for variant in variants:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=button_text(
+                        f"{variant['volume']} — "
+                        f"{variant['price']} "
+                        f"{settings.currency}"
+                    ),
+                    callback_data=(
+                        f"cart:add:{product_id}:"
+                        f"{variant['id']}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=text(language, "back"),
+                callback_data=(
+                    f"category:{category_id}"
+                ),
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
 def cart_keyboard(
     cart: list[Any],
     language: str,
@@ -252,11 +293,23 @@ def cart_keyboard(
 
     for item in cart:
         product_id = int(item["product_id"])
+        variant_id = int(item["variant_id"] or 0)
         quantity = int(item["quantity"])
+
         name = localized_value(
             item,
             "name",
             language,
+        )
+
+        volume = str(
+            item["volume"] or ""
+        ).strip()
+
+        item_name = (
+            f"{name} ({volume})"
+            if volume
+            else name
         )
 
         rows.append(
@@ -264,12 +317,13 @@ def cart_keyboard(
                 InlineKeyboardButton(
                     text="➖",
                     callback_data=(
-                        f"cart:minus:{product_id}"
+                        f"cart:minus:{product_id}:"
+                        f"{variant_id}"
                     ),
                 ),
                 InlineKeyboardButton(
                     text=button_text(
-                        f"{name}: {quantity}",
+                        f"{item_name}: {quantity}",
                         50,
                     ),
                     callback_data="noop",
@@ -277,7 +331,8 @@ def cart_keyboard(
                 InlineKeyboardButton(
                     text="➕",
                     callback_data=(
-                        f"cart:plus:{product_id}"
+                        f"cart:plus:{product_id}:"
+                        f"{variant_id}"
                     ),
                 ),
             ]
@@ -695,6 +750,38 @@ def admin_products_keyboard(
     )
 
 
+def admin_product_variants_keyboard(
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить ещё объём",
+                    callback_data=(
+                        "admin:product:variant:add"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Завершить и добавить фото",
+                    callback_data=(
+                        "admin:product:variant:done"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=(
+                        "admin:product:cancel"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
 def admin_product_categories_keyboard(
     categories: list[Any],
     action: str,
@@ -758,6 +845,14 @@ def admin_product_keyboard(
                     callback_data=(
                         f"admin:product:edit:"
                         f"{product_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚖️ Объёмы и цены",
+                    callback_data=(
+                        f"admin:product:variants:{product_id}"
                     ),
                 )
             ],
@@ -1248,6 +1343,110 @@ def admin_payment_keyboard(
                 InlineKeyboardButton(
                     text="⬅️ К QR-платежам",
                     callback_data="admin:payments",
+                )
+            ],
+        ]
+    )
+
+
+def admin_product_variant_list_keyboard(
+    product_id: int,
+    variants: list[Any],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for variant in variants:
+        status = (
+            "✅"
+            if bool(variant["is_active"])
+            else "🚫"
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=button_text(
+                        f"{status} {variant['volume']} — "
+                        f"{variant['price']} "
+                        f"{settings.currency}",
+                        55,
+                    ),
+                    callback_data=(
+                        f"admin:variant:"
+                        f"{int(variant['id'])}"
+                    ),
+                )
+            ]
+        )
+
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить объём",
+                    callback_data=(
+                        f"admin:variant:add:{product_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К товару",
+                    callback_data=(
+                        f"admin:product:{product_id}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def admin_product_variant_keyboard(
+    variant_id: int,
+    product_id: int,
+    is_active: bool,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить",
+                    callback_data=(
+                        f"admin:variant:edit:{variant_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "🚫 Скрыть"
+                        if is_active
+                        else "✅ Показать"
+                    ),
+                    callback_data=(
+                        f"admin:variant:toggle:{variant_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=(
+                        f"admin:variant:delete:{variant_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К объёмам",
+                    callback_data=(
+                        f"admin:product:variants:"
+                        f"{product_id}"
+                    ),
                 )
             ],
         ]

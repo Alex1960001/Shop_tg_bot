@@ -31,7 +31,8 @@ class AdminProductCreateState(StatesGroup):
     description_ru = State()
     description_cs = State()
     description_uk = State()
-    price = State()
+    variant_volume = State()
+    variant_price = State()
     photo = State()
 
 
@@ -43,6 +44,13 @@ class AdminProductEditState(StatesGroup):
     description_cs = State()
     description_uk = State()
     price = State()
+
+
+class AdminProductVariantEditState(StatesGroup):
+    add_volume = State()
+    add_price = State()
+    edit_volume = State()
+    edit_price = State()
 
 
 class AdminProductPhotoState(StatesGroup):

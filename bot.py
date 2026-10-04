@@ -30,6 +30,12 @@ from config import (
 )
 from database import (
     add_to_cart,
+    create_product_variant,
+    delete_product_variant,
+    get_product_variant,
+    set_product_variant_active,
+    update_product_variant,
+    get_product_variants,
     clear_cart,
     confirm_qr_payment,
     count_users,
@@ -69,6 +75,10 @@ from database import (
 )
 from keyboards import (
     admin_back_keyboard,
+    admin_product_variants_keyboard,
+    admin_product_variant_keyboard,
+    admin_product_variant_list_keyboard,
+    product_variants_keyboard,
     admin_cancel_keyboard,
     admin_categories_keyboard,
     admin_category_delete_keyboard,
@@ -108,6 +118,7 @@ from states import (
     AdminProductEditState,
     AdminProductPhotoState,
     CheckoutState,
+    AdminProductVariantEditState,
 )
 from texts import localized_value, text
 
@@ -312,15 +323,14 @@ def format_product(
     product: Any,
     language: str,
 ) -> str:
-    name = localized_value(
-        product,
-        "name",
-        language,
-    )
+    name = localized_value(product, "name", language)
     description = localized_value(
         product,
         "description",
         language,
+    )
+    variants = get_product_variants(
+        int(product["id"])
     )
 
     lines = [
@@ -329,21 +339,28 @@ def format_product(
     ]
 
     if description:
-        lines.extend(
-            [
-                escape(description),
-                "",
-            ]
+        lines.extend([escape(description), ""])
+
+    if variants:
+        lines.append(
+            text(language, "product_variants")
         )
 
-    lines.append(
-        text(
-            language,
-            "product_price",
-            price=int(product["price"]),
-            currency=settings.currency,
+        for variant in variants:
+            lines.append(
+                f"• {escape(str(variant['volume']))} — "
+                f"<b>{int(variant['price'])} "
+                f"{settings.currency}</b>"
+            )
+    else:
+        lines.append(
+            text(
+                language,
+                "product_price",
+                price=int(product["price"]),
+                currency=settings.currency,
+            )
         )
-    )
 
     return "\n".join(lines)
 
@@ -1031,14 +1048,29 @@ async def product_callback(
         product,
         language,
     )
-    markup = product_keyboard(
-        product_id=product_id,
-        category_id=int(
-            product["category_id"]
-        ),
-        language=language,
-        in_stock=True,
+
+    variants = get_product_variants(
+        product_id
     )
+
+    if variants:
+        markup = product_variants_keyboard(
+            product_id=product_id,
+            category_id=int(
+                product["category_id"]
+            ),
+            variants=variants,
+            language=language,
+        )
+    else:
+        markup = product_keyboard(
+            product_id=product_id,
+            category_id=int(
+                product["category_id"]
+            ),
+            language=language,
+            in_stock=True,
+        )
 
     await callback.answer()
 
@@ -1104,7 +1136,7 @@ async def cart_handler(
 
 
 @dp.callback_query(
-    F.data.regexp(r"^cart:add:\d+$")
+    F.data.regexp(r"^cart:add:\d+(?::\d+)?$")
 )
 async def add_to_cart_callback(
     callback: CallbackQuery,
@@ -1112,31 +1144,34 @@ async def add_to_cart_callback(
     language = user_language(
         callback.from_user.id
     )
-    product_id = int(
-        str(callback.data).split(":")[2]
+    parts = str(callback.data).split(":")
+    product_id = int(parts[2])
+    variant_id = (
+        int(parts[3])
+        if len(parts) > 3
+        else None
     )
 
     success = add_to_cart(
         callback.from_user.id,
         product_id,
         1,
+        variant_id,
     )
 
     await callback.answer(
         text(
             language,
-            (
-                "added_to_cart"
-                if success
-                else "add_failed"
-            ),
+            "added_to_cart"
+            if success
+            else "add_failed",
         ),
         show_alert=not success,
     )
 
 
 @dp.callback_query(
-    F.data.regexp(r"^cart:plus:\d+$")
+    F.data.regexp(r"^cart:plus:\d+:\d+$")
 )
 async def cart_plus_callback(
     callback: CallbackQuery,
@@ -1144,18 +1179,22 @@ async def cart_plus_callback(
     language = user_language(
         callback.from_user.id
     )
-    product_id = int(
-        str(callback.data).split(":")[2]
+    parts = str(callback.data).split(":")
+    product_id = int(parts[2])
+    variant_value = int(parts[3])
+    variant_id = (
+        variant_value
+        if variant_value > 0
+        else None
     )
 
     item = next(
         (
             row
-            for row in get_cart(
-                callback.from_user.id
-            )
-            if int(row["product_id"])
-            == product_id
+            for row in get_cart(callback.from_user.id)
+            if int(row["product_id"]) == product_id
+            and int(row["variant_id"] or 0)
+            == variant_value
         ),
         None,
     )
@@ -1171,26 +1210,28 @@ async def cart_plus_callback(
         callback.from_user.id,
         product_id,
         int(item["quantity"]) + 1,
+        variant_id,
     )
-
-    if not success:
-        await callback.answer(
-            text(language, "add_failed"),
-            show_alert=True,
-        )
-        return
 
     await callback.answer(
-        text(language, "quantity_changed")
+        text(
+            language,
+            "quantity_changed"
+            if success
+            else "add_failed",
+        ),
+        show_alert=not success,
     )
-    await refresh_cart_callback(
-        callback,
-        language,
-    )
+
+    if success:
+        await refresh_cart_callback(
+            callback,
+            language,
+        )
 
 
 @dp.callback_query(
-    F.data.regexp(r"^cart:minus:\d+$")
+    F.data.regexp(r"^cart:minus:\d+:\d+$")
 )
 async def cart_minus_callback(
     callback: CallbackQuery,
@@ -1198,18 +1239,22 @@ async def cart_minus_callback(
     language = user_language(
         callback.from_user.id
     )
-    product_id = int(
-        str(callback.data).split(":")[2]
+    parts = str(callback.data).split(":")
+    product_id = int(parts[2])
+    variant_value = int(parts[3])
+    variant_id = (
+        variant_value
+        if variant_value > 0
+        else None
     )
 
     item = next(
         (
             row
-            for row in get_cart(
-                callback.from_user.id
-            )
-            if int(row["product_id"])
-            == product_id
+            for row in get_cart(callback.from_user.id)
+            if int(row["product_id"]) == product_id
+            and int(row["variant_id"] or 0)
+            == variant_value
         ),
         None,
     )
@@ -1225,22 +1270,24 @@ async def cart_minus_callback(
         callback.from_user.id,
         product_id,
         int(item["quantity"]) - 1,
+        variant_id,
     )
-
-    if not success:
-        await callback.answer(
-            text(language, "add_failed"),
-            show_alert=True,
-        )
-        return
 
     await callback.answer(
-        text(language, "quantity_changed")
+        text(
+            language,
+            "quantity_changed"
+            if success
+            else "add_failed",
+        ),
+        show_alert=not success,
     )
-    await refresh_cart_callback(
-        callback,
-        language,
-    )
+
+    if success:
+        await refresh_cart_callback(
+            callback,
+            language,
+        )
 
 
 @dp.callback_query(F.data == "cart:clear")
@@ -2110,11 +2157,43 @@ async def show_admin_product(
         if category
         else "Категория удалена"
     )
+
     status = (
         "✅ Показывается"
         if bool(product["is_active"])
         else "🚫 Скрыт"
     )
+
+    variants = get_product_variants(
+        product_id,
+        active_only=False,
+    )
+
+    if variants:
+        variant_lines = []
+
+        for variant in variants:
+            variant_status = (
+                "✅"
+                if bool(variant["is_active"])
+                else "🚫"
+            )
+            variant_lines.append(
+                f"{variant_status} "
+                f"{escape(str(variant['volume']))} — "
+                f"<b>{int(variant['price'])} "
+                f"{settings.currency}</b>"
+            )
+
+        price_text = (
+            "<b>Объёмы и цены:</b>\n"
+            + "\n".join(variant_lines)
+        )
+    else:
+        price_text = (
+            f"Цена: <b>{int(product['price'])} "
+            f"{settings.currency}</b>"
+        )
 
     product_text = (
         "🧴 <b>Товар</b>\n\n"
@@ -2123,16 +2202,16 @@ async def show_admin_product(
         f"🇷🇺 {escape(str(product['name_ru']))}\n"
         f"🇨🇿 {escape(str(product['name_cs']))}\n"
         f"🇺🇦 {escape(str(product['name_uk']))}\n\n"
-        f"{escape(str(product['description_ru'] or ''))}\n\n"
-        f"Цена: <b>{int(product['price'])} "
-        f"{settings.currency}</b>\n"
-
+        f"{escape(str(product['description_ru'] or ''))}"
+        f"\n\n{price_text}\n\n"
         f"Статус: {status}"
     )
+
     markup = admin_product_keyboard(
         int(product["id"]),
         bool(product["is_active"]),
     )
+
     photo = str(
         product["photo"] or ""
     ).strip()
@@ -2161,6 +2240,81 @@ async def show_admin_product(
         reply_markup=markup,
     )
 
+
+async def show_admin_product_variants(
+    message: Message,
+    product_id: int,
+) -> None:
+    product = get_product(product_id)
+
+    if product is None:
+        await replace_message(
+            message,
+            "Товар не найден.",
+            admin_back_keyboard(),
+        )
+        return
+
+    variants = get_product_variants(
+        product_id,
+        active_only=False,
+    )
+
+    await replace_message(
+        message,
+        (
+            "⚖️ <b>Объёмы и цены</b>\n\n"
+            f"Товар: {escape(str(product['name_ru']))}\n\n"
+            "Выберите вариант:"
+            if variants
+            else (
+                "⚖️ <b>Объёмы и цены</b>\n\n"
+                f"Товар: {escape(str(product['name_ru']))}\n\n"
+                "Вариантов пока нет."
+            )
+        ),
+        admin_product_variant_list_keyboard(
+            product_id,
+            variants,
+        ),
+    )
+
+
+async def show_admin_product_variant(
+    message: Message,
+    variant_id: int,
+) -> None:
+    variant = get_product_variant(variant_id)
+
+    if variant is None:
+        await replace_message(
+            message,
+            "Вариант не найден.",
+            admin_back_keyboard(),
+        )
+        return
+
+    status = (
+        "✅ Показывается"
+        if bool(variant["is_active"])
+        else "🚫 Скрыт"
+    )
+
+    await replace_message(
+        message,
+        (
+            "⚖️ <b>Вариант товара</b>\n\n"
+            f"Объём: {escape(str(variant['volume']))}\n"
+            f"Цена: <b>{int(variant['price'])} "
+            f"{settings.currency}</b>\n"
+            f"Статус: {status}"
+        ),
+        admin_product_variant_keyboard(
+            int(variant["id"]),
+            int(variant["product_id"]),
+            bool(variant["is_active"]),
+        ),
+    )
 
 async def ask_product_field(
     message: Message,
@@ -3189,31 +3343,55 @@ async def product_create_description_uk(
     await ask_product_field(
         message,
         state,
-        AdminProductCreateState.price,
+        AdminProductCreateState.variant_volume,
         "description_uk",
         message.text or "",
-        (
-            "Введите цену целым числом "
-            f"в {settings.currency}:"
-        ),
+        "Введите объём, например: 50 мл",
     )
 
 
-@dp.message(AdminProductCreateState.price)
-async def product_create_price(
+@dp.message(AdminProductCreateState.variant_volume)
+async def product_create_variant_volume(
     message: Message,
     state: FSMContext,
 ) -> None:
-    if not await require_admin_message(
-        message,
-        state,
-    ):
+    if not await require_admin_message(message, state):
+        return
+
+    volume = " ".join(
+        (message.text or "").strip().split()
+    )
+
+    if not volume or len(volume) > 40:
+        await message.answer(
+            "Введите корректный объём, например: 50 мл."
+        )
+        return
+
+    await state.update_data(
+        current_variant_volume=volume
+    )
+    await state.set_state(
+        AdminProductCreateState.variant_price
+    )
+    await message.answer(
+        f"Введите цену для объёма {escape(volume)} "
+        f"в {settings.currency}:",
+        reply_markup=admin_product_cancel_keyboard(),
+    )
+
+
+@dp.message(AdminProductCreateState.variant_price)
+async def product_create_variant_price(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_message(message, state):
         return
 
     try:
-        price = int(
-            (message.text or "").strip()
-        )
+        price = int((message.text or "").strip())
+
         if price <= 0:
             raise ValueError
     except ValueError:
@@ -3222,17 +3400,92 @@ async def product_create_price(
         )
         return
 
-    await state.update_data(price=price)
+    data = await state.get_data()
+    volume = str(
+        data.get("current_variant_volume", "")
+    )
+    variants = list(data.get("variants", []))
+
+    if any(
+        str(item["volume"]).casefold()
+        == volume.casefold()
+        for item in variants
+    ):
+        await message.answer(
+            "Такой объём уже добавлен."
+        )
+        return
+
+    variants.append({
+        "volume": volume,
+        "price": price,
+    })
+
+    await state.update_data(
+        variants=variants,
+        current_variant_volume=None,
+    )
+
+    await message.answer(
+        (
+            f"✅ Добавлен вариант: {escape(volume)} — "
+            f"{price} {settings.currency}"
+        ),
+        reply_markup=admin_product_variants_keyboard(),
+    )
+
+
+@dp.callback_query(
+    F.data == "admin:product:variant:add"
+)
+async def product_create_variant_add(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    await state.set_state(
+        AdminProductCreateState.variant_volume
+    )
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "Введите следующий объём:",
+            reply_markup=admin_product_cancel_keyboard(),
+        )
+
+
+@dp.callback_query(
+    F.data == "admin:product:variant:done"
+)
+async def product_create_variant_done(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    data = await state.get_data()
+
+    if not data.get("variants"):
+        await callback.answer(
+            "Добавьте хотя бы один объём.",
+            show_alert=True,
+        )
+        return
+
     await state.set_state(
         AdminProductCreateState.photo
     )
-    await message.answer(
-        "Отправьте фотографию товара.",
-        reply_markup=(
-            admin_product_cancel_keyboard()
-        ),
-    )
+    await callback.answer()
 
+    if callback.message:
+        await callback.message.answer(
+            "Отправьте фотографию товара.",
+            reply_markup=admin_product_cancel_keyboard(),
+        )
 
 @dp.message(
     AdminProductCreateState.photo,
@@ -3251,6 +3504,12 @@ async def product_create_photo(
     data = await state.get_data()
 
     try:
+        variants = list(data["variants"])
+        base_price = min(
+            int(item["price"])
+            for item in variants
+        )
+
         product_id = create_product(
             category_id=int(data["category_id"]),
             code=(
@@ -3260,20 +3519,22 @@ async def product_create_photo(
             name_ru=str(data["name_ru"]),
             name_cs=str(data["name_cs"]),
             name_uk=str(data["name_uk"]),
-            description_ru=str(
-                data["description_ru"]
-            ),
-            description_cs=str(
-                data["description_cs"]
-            ),
-            description_uk=str(
-                data["description_uk"]
-            ),
-            price=int(data["price"]),
+            description_ru=str(data["description_ru"]),
+            description_cs=str(data["description_cs"]),
+            description_uk=str(data["description_uk"]),
+            price=base_price,
             stock=0,
             photo=message.photo[-1].file_id,
             sort_order=0,
         )
+
+        for index, variant in enumerate(variants):
+            create_product_variant(
+                product_id=product_id,
+                volume=str(variant["volume"]),
+                price=int(variant["price"]),
+                sort_order=index,
+            )
     except (KeyError, ValueError) as error:
         await state.clear()
         await message.answer(
@@ -3953,6 +4214,356 @@ async def product_edit_price(
         reply_markup=admin_main_keyboard(),
     )
 
+
+@dp.callback_query(
+    F.data.regexp(
+        r"^admin:product:variants:\d+$"
+    )
+)
+async def admin_product_variants_open(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    product_id = int(
+        str(callback.data).split(":")[3]
+    )
+
+    await state.clear()
+    await callback.answer()
+
+    if callback.message:
+        await show_admin_product_variants(
+            callback.message,
+            product_id,
+        )
+
+
+@dp.callback_query(
+    F.data.regexp(r"^admin:variant:\d+$")
+)
+async def admin_variant_open(
+    callback: CallbackQuery,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    variant_id = int(
+        str(callback.data).split(":")[2]
+    )
+    await callback.answer()
+
+    if callback.message:
+        await show_admin_product_variant(
+            callback.message,
+            variant_id,
+        )
+
+
+@dp.callback_query(
+    F.data.regexp(r"^admin:variant:add:\d+$")
+)
+async def admin_variant_add_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    product_id = int(
+        str(callback.data).split(":")[3]
+    )
+
+    if get_product(product_id) is None:
+        await callback.answer(
+            "Товар не найден",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.update_data(
+        product_id=product_id
+    )
+    await state.set_state(
+        AdminProductVariantEditState.add_volume
+    )
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "Введите новый объём:",
+            reply_markup=admin_product_cancel_keyboard(),
+        )
+
+
+@dp.message(
+    AdminProductVariantEditState.add_volume
+)
+async def admin_variant_add_volume(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_message(message, state):
+        return
+
+    volume = " ".join(
+        (message.text or "").strip().split()
+    )
+
+    if not volume or len(volume) > 40:
+        await message.answer(
+            "Введите корректный объём."
+        )
+        return
+
+    await state.update_data(volume=volume)
+    await state.set_state(
+        AdminProductVariantEditState.add_price
+    )
+    await message.answer(
+        f"Введите цену для {escape(volume)}:",
+        reply_markup=admin_product_cancel_keyboard(),
+    )
+
+
+@dp.message(
+    AdminProductVariantEditState.add_price
+)
+async def admin_variant_add_price(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_message(message, state):
+        return
+
+    try:
+        price = int((message.text or "").strip())
+
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            "Введите положительное целое число."
+        )
+        return
+
+    data = await state.get_data()
+
+    try:
+        product_id = int(data["product_id"])
+
+        create_product_variant(
+            product_id=product_id,
+            volume=str(data["volume"]),
+            price=price,
+            sort_order=len(
+                get_product_variants(
+                    product_id,
+                    active_only=False,
+                )
+            ),
+        )
+    except (KeyError, ValueError) as error:
+        await message.answer(
+            f"Ошибка: {escape(str(error))}"
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "✅ Объём добавлен.",
+        reply_markup=admin_main_keyboard(),
+    )
+
+
+@dp.callback_query(
+    F.data.regexp(r"^admin:variant:edit:\d+$")
+)
+async def admin_variant_edit_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    variant_id = int(
+        str(callback.data).split(":")[3]
+    )
+
+    if get_product_variant(variant_id) is None:
+        await callback.answer(
+            "Вариант не найден",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.update_data(
+        variant_id=variant_id
+    )
+    await state.set_state(
+        AdminProductVariantEditState.edit_volume
+    )
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "Введите новый объём:",
+            reply_markup=admin_product_cancel_keyboard(),
+        )
+
+
+@dp.message(
+    AdminProductVariantEditState.edit_volume
+)
+async def admin_variant_edit_volume(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_message(message, state):
+        return
+
+    volume = " ".join(
+        (message.text or "").strip().split()
+    )
+
+    if not volume or len(volume) > 40:
+        await message.answer(
+            "Введите корректный объём."
+        )
+        return
+
+    await state.update_data(volume=volume)
+    await state.set_state(
+        AdminProductVariantEditState.edit_price
+    )
+    await message.answer(
+        "Введите новую цену:",
+        reply_markup=admin_product_cancel_keyboard(),
+    )
+
+
+@dp.message(
+    AdminProductVariantEditState.edit_price
+)
+async def admin_variant_edit_price(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not await require_admin_message(message, state):
+        return
+
+    try:
+        price = int((message.text or "").strip())
+
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            "Введите положительное целое число."
+        )
+        return
+
+    data = await state.get_data()
+
+    try:
+        updated = update_product_variant(
+            variant_id=int(data["variant_id"]),
+            volume=str(data["volume"]),
+            price=price,
+        )
+    except (KeyError, ValueError) as error:
+        await message.answer(
+            f"Ошибка: {escape(str(error))}"
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        (
+            "✅ Вариант изменён."
+            if updated
+            else "Вариант не найден."
+        ),
+        reply_markup=admin_main_keyboard(),
+    )
+
+
+@dp.callback_query(
+    F.data.regexp(r"^admin:variant:toggle:\d+$")
+)
+async def admin_variant_toggle(
+    callback: CallbackQuery,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    variant_id = int(
+        str(callback.data).split(":")[3]
+    )
+    variant = get_product_variant(variant_id)
+
+    if variant is None:
+        await callback.answer(
+            "Вариант не найден",
+            show_alert=True,
+        )
+        return
+
+    set_product_variant_active(
+        variant_id,
+        not bool(variant["is_active"]),
+    )
+    await callback.answer("Статус изменён")
+
+    if callback.message:
+        await show_admin_product_variant(
+            callback.message,
+            variant_id,
+        )
+
+
+@dp.callback_query(
+    F.data.regexp(r"^admin:variant:delete:\d+$")
+)
+async def admin_variant_delete(
+    callback: CallbackQuery,
+) -> None:
+    if not await require_admin_callback(callback):
+        return
+
+    variant_id = int(
+        str(callback.data).split(":")[3]
+    )
+    variant = get_product_variant(variant_id)
+
+    if variant is None:
+        await callback.answer(
+            "Вариант не найден",
+            show_alert=True,
+        )
+        return
+
+    product_id = int(variant["product_id"])
+
+    if not delete_product_variant(variant_id):
+        await callback.answer(
+            "Вариант используется в заказах. "
+            "Его можно только скрыть.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("Вариант удалён")
+
+    if callback.message:
+        await show_admin_product_variants(
+            callback.message,
+            product_id,
+        )
 # ----------------------------------------------------------------------
 # Администратор — заказы
 # ----------------------------------------------------------------------
